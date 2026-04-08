@@ -4,7 +4,9 @@
 # 2.0.
 
 # Standard packages
-import itertools
+import json
+import math
+import re
 import time
 import traceback
 from typing import Any, Dict, List, Optional
@@ -30,6 +32,186 @@ SEARCH_FIELDS = utils.get_search_fields_from_mapping("evaluations")
 VALID_METRICS = set([ "mrr", "ndcg", "precision", "recall" ])
 
 logger = logging.getLogger(__name__)
+
+# Top-level keys stripped from strategy templates before evaluation.
+_STRIP_KEYS = {"aggs", "aggregations", "highlight"}
+
+
+def _sanitize_template(source: str) -> str:
+    """Strip aggregations and highlight from a strategy template and fix
+    trailing commas that would cause JSON parse errors."""
+    try:
+        parsed = json.loads(source)
+        for key in _STRIP_KEYS:
+            parsed.pop(key, None)
+        return json.dumps(parsed)
+    except json.JSONDecodeError:
+        return re.sub(r',\s*(?=[}\]])', '', source)
+
+
+def _extract_inner_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote a collapse inner_hit so the caller sees a normal ES hit.
+
+    When a query uses collapse + inner_hits the outer hit may carry an
+    arbitrary version's ``_id``.  The *real* document (e.g. latest version)
+    lives inside the first inner_hit entry that has ``_source`` data.
+    For non-collapsed queries this is a no-op.
+    """
+    inner_hits = hit.get("inner_hits")
+    if not inner_hits:
+        return hit
+    for _name, ih in inner_hits.items():
+        nested = ih.get("hits", {}).get("hits", [])
+        if nested and nested[0].get("_source"):
+            inner = nested[0]
+            inner["_score"] = hit.get("_score")
+            return inner
+    return hit
+
+
+# ── Metric computation ───────────────────────────────────────────────────────
+#
+# Elasticsearch's rank_eval API ignores ``collapse`` and ``inner_hits``,
+# returning arbitrary document versions and producing incorrect scores for
+# our unified-index strategy.  Because every strategy collapses to a single
+# version per package, we run the real search via ``search_template`` and
+# compute metrics ourselves so results match the actual search experience.
+
+def _compute_ndcg(rated_hits: List[Dict], all_ratings: List[Dict], k: int) -> float:
+    """Normalized Discounted Cumulative Gain at *k*."""
+    dcg = 0.0
+    for i, rh in enumerate(rated_hits[:k]):
+        rating = rh.get("rating") or 0
+        dcg += rating / math.log2(i + 2)
+
+    ideal_ratings = sorted(
+        [r["rating"] for r in all_ratings if r["rating"] is not None],
+        reverse=True,
+    )
+    idcg = 0.0
+    for i, r in enumerate(ideal_ratings[:k]):
+        idcg += r / math.log2(i + 2)
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def _compute_precision(rated_hits: List[Dict], k: int, ignore_unlabeled: bool = False) -> float:
+    """Precision at *k*. Unlabeled docs count as irrelevant unless ignored."""
+    hits = rated_hits[:k]
+    if not hits:
+        return 0.0
+    relevant = 0
+    counted = 0
+    for rh in hits:
+        rating = rh.get("rating")
+        if rating is None and ignore_unlabeled:
+            continue
+        counted += 1
+        if rating is not None and rating > 0:
+            relevant += 1
+    denom = counted if ignore_unlabeled else k
+    return relevant / denom if denom > 0 else 0.0
+
+
+def _compute_recall(rated_hits: List[Dict], all_ratings: List[Dict], k: int) -> float:
+    """Recall at *k*."""
+    total_relevant = sum(1 for r in all_ratings if r.get("rating") is not None and r["rating"] > 0)
+    if total_relevant == 0:
+        return 0.0
+    found = sum(1 for rh in rated_hits[:k] if (rh.get("rating") or 0) > 0)
+    return found / total_relevant
+
+
+def _compute_mrr(rated_hits: List[Dict], k: int, relevant_rating_threshold: int = 1) -> float:
+    """Mean Reciprocal Rank at *k*."""
+    for i, rh in enumerate(rated_hits[:k]):
+        if (rh.get("rating") or 0) >= relevant_rating_threshold:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
+_METRIC_DISPATCH = {
+    "dcg":                    lambda rh, ar, k, cfg: _compute_ndcg(rh, ar, k) if cfg.get("normalize") else sum((h.get("rating") or 0) / math.log2(i + 2) for i, h in enumerate(rh[:k])),
+    "mean_reciprocal_rank":   lambda rh, ar, k, cfg: _compute_mrr(rh, k, cfg.get("relevant_rating_threshold", 1)),
+    "precision":              lambda rh, ar, k, cfg: _compute_precision(rh, k, cfg.get("ignore_unlabeled", False)),
+    "recall":                 lambda rh, ar, k, cfg: _compute_recall(rh, ar, k),
+}
+
+
+def _evaluate_template(
+    template_source: str,
+    index_pattern: str,
+    scenarios: Dict[str, Dict],
+    ratings: Dict[str, List[Dict]],
+    scenario_ids: List[str],
+    metric_name: str,
+    metric_config: Dict[str, Any],
+    k: int,
+) -> Dict[str, Any]:
+    """Run a strategy template via ``search_template`` and score the results.
+
+    This replaces ES ``rank_eval`` because ``rank_eval`` ignores ``collapse``
+    and ``inner_hits``.  Since every strategy on the unified index collapses
+    to one version per package, we must run the real search to evaluate the
+    results users actually see.
+
+    Returns a structure compatible with the rest of the evaluation pipeline::
+
+        {"details": {scenario_id: {"metric_score": float, "hits": [...]}},
+         "failures": {}}
+    """
+    compute = _METRIC_DISPATCH.get(metric_name, lambda *_: 0.0)
+    details: Dict[str, Any] = {}
+
+    for scenario_id in scenario_ids:
+        if scenario_id not in ratings or not ratings[scenario_id]:
+            continue
+
+        params = scenarios.get(scenario_id)
+        if not params:
+            continue
+
+        try:
+            es_response = es("content").search_template(
+                index=index_pattern,
+                body={"source": template_source, "params": params},
+            )
+        except Exception as exc:
+            logger.warning("Search failed for scenario %s: %s", scenario_id, exc)
+            continue
+
+        ratings_lookup: Dict[tuple, int] = {}
+        for r in ratings[scenario_id]:
+            ratings_lookup[(r["_index"], r["_id"])] = r["rating"]
+
+        hits_body = es_response.body.get("hits", {}).get("hits", [])
+        rated_hits: List[Dict] = []
+        raw_hits: List[Dict] = []
+        for hit in hits_body[:k]:
+            effective = _extract_inner_hit(hit)
+            _index = effective.get("_index", "")
+            _id = effective.get("_id", "")
+            rating = ratings_lookup.get((_index, _id))
+
+            rated_hits.append({"rating": rating})
+            effective.pop("sort", None)
+            raw_hits.append({
+                "hit": {"_id": _id, "_index": _index},
+                "rating": rating,
+            })
+
+        all_ratings_for_scenario = [
+            {"rating": r["rating"]} for r in ratings[scenario_id]
+        ]
+
+        score = compute(rated_hits, all_ratings_for_scenario, k, metric_config)
+
+        details[scenario_id] = {
+            "metric_score": score,
+            "hits": raw_hits,
+        }
+
+    return {"details": details, "failures": {}}
+
 
 def _generate_summary_metrics(searches_list):
     """Calculate aggregated metrics from a list of search results.
@@ -272,13 +454,6 @@ def run(
         evaluation["strategy_id"] = sorted([ c["_id"] for c in candidates["strategies"] ])
         evaluation["scenario_id"] = sorted([ c["_id"] for c in candidates["scenarios"] ])
         
-        # Prepare _rank_eval request
-        _rank_eval = {
-            "templates": [],
-            "requests": [],
-            "metric": {}
-        }
-        
         # Store the contents of the assets used at runtime in this evaluation
         evaluation["runtime"] = {
             "indices": {},
@@ -301,8 +476,7 @@ def run(
         # TODO: rating_scale_max will be used when implementing the err metric
         rating_scale_max = es_response.body["_source"]["rating_scale"]["max"]
         
-        # Get the strategies, add them to "templates" in _rank_eval,
-        # and track their runtime contents.
+        # Get the strategies and track their runtime contents.
         hits = []
         
         # Don't fetch strategies that were given as docs 
@@ -333,16 +507,16 @@ def run(
                     "_id": hit["_id"],
                     "_source": hit["_source"]
                 })
+        # strategy_id -> sanitized template source
+        _templates = {}
+
         for hit in hits:
-            template = hit["_source"]["template"]["source"]
-            _rank_eval["templates"].append({
-                "id": hit["_id"],
-                "template": {
-                    "source": template
-                }
-            })
+            raw_template = hit["_source"]["template"]["source"]
+            sanitized = _sanitize_template(raw_template)
+            _templates[hit["_id"]] = sanitized
+
             runtime_strategy = {
-                "_fingerprint": utils.fingerprint([ template ])
+                "_fingerprint": utils.fingerprint([sanitized])
             }
             for field, value in hit["_source"].items():
                 if field == "workspace_id":
@@ -350,9 +524,9 @@ def run(
                 runtime_strategy[field] = value
             evaluation["runtime"]["strategies"][hit["_id"]] = runtime_strategy
         
-        # Get judgements, add them to "ratings" in _rank_eval, and track their
-        # original contents. Track which scenarios had judgements, in case the
-        # request includes scenarios that have no judgements.
+        # Get judgements and track their original contents.
+        # Track which scenarios had judgements, in case the request includes
+        # scenarios that have no judgements.
         # 
         # TODO: Implement random sampling for judgements, because there could be
         # more than 10,000 judgements per scenario.
@@ -430,7 +604,7 @@ def run(
             # Fallback for serverless mode where indices.stats API is not available
             evaluation["runtime"]["indices"] = {}
         
-        # Configure the metrics for _rank_eval
+        # Metric configurations (maps short name -> ES metric name + config)
         metrics_config = {
             # TODO: Support other types of metrics (commented out below)
             #"dcg": {
@@ -492,71 +666,42 @@ def run(
                 )
             return evaluation
         
-        # Create a set of requests for each evaluation metric
+        # Evaluate each metric × strategy via search_template so that
+        # every query feature (collapse, inner_hits, script sorts, etc.)
+        # is honoured exactly as it runs in production.
+        k = evaluation["task"]["k"]
+
         for m in evaluation["task"]["metrics"]:
-            
-            # Run rank_eval one strategy at a time to scale for larger benchmarks
-            for template in _rank_eval["templates"]:
-            
-                # Reset the metric and requests for this iterartion
-                _rank_eval["metric"] = {}
-                _rank_eval["requests"] = []
-                
-                # Define the metric for this iteration
-                metric_name = metrics_config[m]["name"]
-                _rank_eval["metric"][metric_name] = metrics_config[m]["config"]
-                
-                # Define requests for each combination of strategies and scenarios
-                grid = list(itertools.product([
-                    template["id"]], # strategy_id
-                    evaluation["scenario_id"], # scenario_id
-                ))
-                for strategy_id, scenario_id in grid:
-                    # Skip scenarios that have no ratings/judgements
-                    if scenario_id not in ratings or not ratings[scenario_id]:
-                        continue
-                        
-                    _rank_eval["requests"].append({
-                        "id": f"{strategy_id}~{scenario_id}",
-                        "template_id": strategy_id,
-                        "params": scenarios[scenario_id],
-                        "ratings": ratings[scenario_id]
-                    })
-                    
-                # Skip if no valid requests (all scenarios have no ratings)
-                if not _rank_eval["requests"]:
-                    continue
-                    
-                # Run _rank_eval on the content deployment and accumulate the results
-                body = {
-                    "metric": _rank_eval["metric"],
-                    "requests": _rank_eval["requests"],
-                    "templates": [ template, ]
-                }
-                es_response = None
+            metric_name = metrics_config[m]["name"]
+            metric_cfg = metrics_config[m]["config"]
+
+            for strategy_id, template_source in _templates.items():
                 try:
-                    es_response = es("content").rank_eval(
-                        index=index_pattern,
-                        body=body
+                    result = _evaluate_template(
+                        template_source=template_source,
+                        index_pattern=index_pattern,
+                        scenarios=scenarios,
+                        ratings=ratings,
+                        scenario_ids=evaluation["scenario_id"],
+                        metric_name=metric_name,
+                        metric_config=metric_cfg,
+                        k=k,
                     )
                 except (ConnectionError, ConnectionTimeout, ApiError) as e:
-                    _results[template["id"]]["failures"].append({
+                    _results[strategy_id]["failures"].append({
                         "scenario_id": None,
                         "metric": m,
                         "error": {
                             "type": e.__class__.__name__,
-                            "reason": str(e)
-                        }
+                            "reason": str(e),
+                        },
                     })
                     continue
-                
-                # Store results
-                for request_id, details in es_response.body["details"].items():
-                    strategy_id, scenario_id = request_id.split("~", 1)
+
+                for scenario_id, details in result["details"].items():
                     _results[strategy_id]["scenarios"][scenario_id]["metrics"][m] = details["metric_score"]
                     if not len(_results[strategy_id]["scenarios"][scenario_id]["hits"]):
                         _results[strategy_id]["scenarios"][scenario_id]["hits"] = details["hits"]
-                        # Find unrated docs
                         for hit in details["hits"]:
                             if hit["rating"] is not None:
                                 continue
@@ -568,21 +713,11 @@ def run(
                                 _unrated_docs[_index][_id] = {
                                     "count": 0,
                                     "strategies": set(),
-                                    "scenarios": set()
+                                    "scenarios": set(),
                                 }
                             _unrated_docs[_index][_id]["count"] += 1
                             _unrated_docs[_index][_id]["strategies"].add(strategy_id)
                             _unrated_docs[_index][_id]["scenarios"].add(scenario_id)
-                
-                # Store failures
-                if es_response.body.get("failures"):
-                    for request_id, failure in es_response.body["failures"].items():
-                        strategy_id, scenario_id = request_id.split("~", 1)
-                        _results[strategy_id]["failures"].append({
-                            "scenario_id": scenario_id,
-                            "metric": m,
-                            "error": failure.get("error") or failure
-                        })
             
         # Restructure results for response
         evaluation["results"] = []
@@ -648,6 +783,13 @@ def run(
             "type": e.__class__.__name__,
             "message": str(e),
             "traceback": "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        }
+        # Reset @meta to only the keys accepted by the validator.
+        # A prior model_validate call (e.g. EvaluationComplete) may have
+        # enriched @meta with stopped_at/status before the ES update failed.
+        evaluation["@meta"] = {
+            "started_at": utils.timestamp(started_at),
+            "started_by": started_by,
         }
         doc = EvaluationFail.model_validate(evaluation).serialize()
         if store_results:
